@@ -49,6 +49,3 @@ test/k8s-integration/config/test-config.yaml
 *.un~
 Session.vim
 .netrwhist
-
-# Claude Code local settings
-.claude/settings.local.json
