@@ -30,12 +30,14 @@ import (
 	"golang.org/x/time/rate"
 	"google.golang.org/api/option"
 	"gopkg.in/gcfg.v1"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/common"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute/tenancy"
 
 	"cloud.google.com/go/compute/metadata"
 	rscmgr "cloud.google.com/go/resourcemanager/apiv3"
 	"golang.org/x/oauth2"
+	computealpha "google.golang.org/api/compute/v0.alpha"
 	computebeta "google.golang.org/api/compute/v0.beta"
 	"google.golang.org/api/compute/v1"
 	computev1 "google.golang.org/api/compute/v1"
@@ -76,6 +78,8 @@ const (
 	// gcpTagsRequestTokenBucketSize is the burst/token bucket size used
 	// for limiting API requests.
 	gcpTagsRequestTokenBucketSize = 8
+
+	pollTimeout = 30 * time.Second
 )
 
 var (
@@ -99,11 +103,12 @@ var (
 // https://github.com/kubernetes-sigs/gcp-compute-persistent-disk-csi-driver/pull/1524
 // for how to add GCE alpha Disk support.
 type CloudProvider struct {
-	service     *compute.Service
-	betaService *computebeta.Service
-	tokenSource oauth2.TokenSource
-	project     string
-	zone        string
+	service      *compute.Service
+	betaService  *computebeta.Service
+	alphaService *computealpha.Service
+	tokenSource  oauth2.TokenSource
+	project      string
+	zone         string
 
 	zonesCache map[string][]string
 
@@ -148,7 +153,7 @@ type ConfigGlobal struct {
 	Zone      string `gcfg:"zone"`
 }
 
-func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath string, computeEndpoint *url.URL, computeEnvironment Environment, waitForAttachConfig WaitForAttachConfig, listInstancesConfig ListInstancesConfig, multiTenancyEnabled bool) (*CloudProvider, error) {
+func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath string, computeEndpoint *url.URL, computeEnvironment Environment, waitForAttachConfig WaitForAttachConfig, listInstancesConfig ListInstancesConfig, multiTenancyEnabled bool, failCloseOnAuthError bool) (*CloudProvider, error) {
 	configFile, err := readConfig(configPath)
 	if err != nil {
 		return nil, err
@@ -163,17 +168,23 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 		return nil, err
 	}
 
-	svc, err := createCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment)
+	svc, err := createCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment, failCloseOnAuthError, pollTimeout)
 	if err != nil {
 		return nil, err
 	}
 	klog.Infof("Compute endpoint for V1 version: %s", svc.BasePath)
 
-	betasvc, err := createBetaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment)
+	betasvc, err := createBetaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment, failCloseOnAuthError, pollTimeout)
 	if err != nil {
 		return nil, err
 	}
 	klog.Infof("Compute endpoint for Beta version: %s", betasvc.BasePath)
+
+	alphasvc, err := createAlphaCloudService(ctx, vendorVersion, tokenSource, computeEndpoint, computeEnvironment, failCloseOnAuthError, pollTimeout)
+	if err != nil {
+		return nil, err
+	}
+	klog.Infof("Compute endpoint for Alpha version: %s", alphasvc.BasePath)
 
 	project, zone, err := getProjectAndZone(configFile)
 	if err != nil {
@@ -183,6 +194,7 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 	cp := &CloudProvider{
 		service:             svc,
 		betaService:         betasvc,
+		alphaService:        alphasvc,
 		tokenSource:         tokenSource,
 		project:             project,
 		zone:                zone,
@@ -197,7 +209,11 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 
 	if multiTenancyEnabled {
 		klog.Info("Setting up multitenancy")
-		ti, err := tenancy.NewTenantsInformer(multiTenancyEnabled, tenancy.GetKubeConfig())
+		cfg, err := config.GetConfig()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get Kubernetes client configuration: %w", err)
+		}
+		ti, err := tenancy.NewTenantsInformer(multiTenancyEnabled, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("failed initializing tenant informer: %w", err)
 		}
@@ -217,7 +233,7 @@ func CreateCloudProvider(ctx context.Context, vendorVersion string, configPath s
 				return nil, fmt.Errorf("error during tenant token source generation: %w", err)
 			}
 
-			tenantComputeService, err := createCloudService(ctx, vendorVersion, tenantTokenSource, computeEndpoint, computeEnvironment)
+			tenantComputeService, err := createCloudService(ctx, vendorVersion, tenantTokenSource, computeEndpoint, computeEnvironment, failCloseOnAuthError, pollTimeout)
 			if err != nil {
 				klog.Errorf("Error while creating compute service with tenant identity for %s: %v", tenantMeta.TenantName, err)
 				return nil, fmt.Errorf("error while creating compute service with tenant identity: %w", err)
@@ -291,10 +307,29 @@ func readConfig(configPath string) (*ConfigFile, error) {
 	return cfg, nil
 }
 
-func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment) (*computebeta.Service, error) {
-	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionBeta)
+func createAlphaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, failCloseOnAuthError bool, timeout time.Duration) (*computealpha.Service, error) {
+	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionAlpha, timeout)
 	if err != nil {
 		klog.Errorf("Failed to get compute endpoint: %s", err)
+		if failCloseOnAuthError {
+			return nil, err
+		}
+	}
+	service, err := computealpha.NewService(ctx, computeOpts...)
+	if err != nil {
+		return nil, err
+	}
+	service.UserAgent = fmt.Sprintf("GCE CSI Driver/%s (%s %s)", vendorVersion, runtime.GOOS, runtime.GOARCH)
+	return service, nil
+}
+
+func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, failCloseOnAuthError bool, timeout time.Duration) (*computebeta.Service, error) {
+	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionBeta, timeout)
+	if err != nil {
+		klog.Errorf("Failed to get compute endpoint: %s", err)
+		if failCloseOnAuthError {
+			return nil, err
+		}
 	}
 	service, err := computebeta.NewService(ctx, computeOpts...)
 	if err != nil {
@@ -304,10 +339,13 @@ func createBetaCloudService(ctx context.Context, vendorVersion string, tokenSour
 	return service, nil
 }
 
-func createCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment) (*compute.Service, error) {
-	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionV1)
+func createCloudService(ctx context.Context, vendorVersion string, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, failCloseOnAuthError bool, timeout time.Duration) (*compute.Service, error) {
+	computeOpts, err := getComputeVersion(ctx, tokenSource, computeEndpoint, computeEnvironment, GCEAPIVersionV1, timeout)
 	if err != nil {
 		klog.Errorf("Failed to get compute endpoint: %s", err)
+		if failCloseOnAuthError {
+			return nil, err
+		}
 	}
 	service, err := compute.NewService(ctx, computeOpts...)
 	if err != nil {
@@ -317,8 +355,8 @@ func createCloudService(ctx context.Context, vendorVersion string, tokenSource o
 	return service, nil
 }
 
-func getComputeVersion(ctx context.Context, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, computeVersion GCEAPIVersion) ([]option.ClientOption, error) {
-	client, err := newOauthClient(ctx, tokenSource)
+func getComputeVersion(ctx context.Context, tokenSource oauth2.TokenSource, computeEndpoint *url.URL, computeEnvironment Environment, computeVersion GCEAPIVersion, timeout time.Duration) ([]option.ClientOption, error) {
+	client, err := newOauthClient(ctx, tokenSource, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -342,7 +380,7 @@ func constructComputeEndpointPath(env Environment, version GCEAPIVersion) string
 }
 
 func createTagValuesClient(ctx context.Context, tokenSource oauth2.TokenSource, resourceManagerHostSubPath string) (*rscmgr.TagValuesClient, error) {
-	client, err := newOauthClient(ctx, tokenSource)
+	client, err := newOauthClient(ctx, tokenSource, pollTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +394,7 @@ func createTagValuesClient(ctx context.Context, tokenSource oauth2.TokenSource, 
 }
 
 func createTagBindingsClient(ctx context.Context, tokenSource oauth2.TokenSource, location string, resourceManagerHostSubPath string) (*rscmgr.TagBindingsClient, error) {
-	client, err := newOauthClient(ctx, tokenSource)
+	client, err := newOauthClient(ctx, tokenSource, pollTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -374,8 +412,8 @@ func createTagBindingsClient(ctx context.Context, tokenSource oauth2.TokenSource
 	return rscmgr.NewTagBindingsRESTClient(ctx, opts...)
 }
 
-func newOauthClient(ctx context.Context, tokenSource oauth2.TokenSource) (*http.Client, error) {
-	if err := wait.PollImmediate(5*time.Second, 30*time.Second, func() (bool, error) {
+func newOauthClient(ctx context.Context, tokenSource oauth2.TokenSource, timeout time.Duration) (*http.Client, error) {
+	if err := wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
 		if _, err := tokenSource.Token(); err != nil {
 			klog.Errorf("error fetching initial token: %v", err.Error())
 			return false, nil

@@ -42,6 +42,7 @@ import (
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/convert"
 	gce "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/gce-cloud-provider/compute"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/k8sclient"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/parameters"
 )
@@ -118,6 +119,12 @@ type GCEControllerServer struct {
 	// If set to true, the CSI Driver will allow volumes to be provisioned with dynamic disk type selection.
 	enableDynamicVolumes bool
 
+	// If set to true, the CSI Driver will update volume publish status labels on GCE disks.
+	enableGCEDiskStatus bool
+
+	// ClusterOwnershipID stores the cluster ownership identifier.
+	clusterOwnershipID string
+
 	multiZoneVolumeHandleConfig MultiZoneVolumeHandleConfig
 
 	listVolumesConfig ListVolumesConfig
@@ -130,12 +137,17 @@ type GCEControllerServer struct {
 
 	EnableDiskTopology       bool
 	EnableDiskSizeValidation bool
+
+	EnablePdConversion bool
 }
 
 type GCEControllerServerArgs struct {
 	EnableDiskTopology       bool
 	EnableDiskSizeValidation bool
 	EnableDynamicVolumes     bool
+	EnableGCEDiskStatus      bool
+	EnablePdConversion       bool
+	ClusterOwnershipID       string
 }
 
 type MultiZoneVolumeHandleConfig struct {
@@ -581,6 +593,20 @@ func (gceCS *GCEControllerServer) updateAccessModeIfNecessary(ctx context.Contex
 	}
 
 	return gceCS.CloudProvider.SetDiskAccessMode(ctx, project, volKey, constants.GCEReadOnlyManyAccessMode)
+}
+
+func (gceCS *GCEControllerServer) updateVolumePublishStatusLabel(ctx context.Context, project string, volKey *meta.Key, disk *gce.CloudDisk, status string) error {
+	labels := disk.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[constants.VolumePublishStatus] = status
+
+	if err := gceCS.CloudProvider.SetDiskLabels(ctx, project, volKey, disk, labels); err != nil {
+		return fmt.Errorf("failed to set labels on disk %v: %w", volKey, err)
+	}
+
+	return nil
 }
 
 func (gceCS *GCEControllerServer) createSingleDeviceDisk(ctx context.Context, req *csi.CreateVolumeRequest, params parameters.DiskParameters, dataCacheParams parameters.DataCacheParameters, enableDataCache bool) (*csi.CreateVolumeResponse, error) {
@@ -1209,6 +1235,12 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 		return nil, status.Errorf(codes.Internal, "error getting device name: %v", err.Error()), disk
 	}
 
+	if gceCS.enableGCEDiskStatus {
+		if err := gceCS.updateVolumePublishStatusLabel(ctx, project, volKey, disk, constants.AttachedStatus); err != nil {
+			klog.Warningf("Failed to update VolumePublishStatus label for disk %v: %v", volKey, err)
+		}
+	}
+
 	attached, err := diskIsAttachedAndCompatible(deviceName, instance, volumeCapability, readWrite)
 	if err != nil {
 		return nil, status.Errorf(codes.AlreadyExists, "Disk %v already published to node %v but incompatible: %v", volKey.Name, nodeID, err.Error()), disk
@@ -1234,7 +1266,13 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 			machineType := parseMachineType(instance.MachineType)
 			return nil, status.Errorf(codes.InvalidArgument, "'%s' is not a compatible disk type with the machine type %s, please review the GCP online documentation for available persistent disk options", udErr.DiskType, machineType), disk
 		}
-		return nil, common.LoggedError("Failed to Attach: ", err), disk
+		klog.Infof("Received error from AttachDisk: %s", err.Error())
+		if isConversionRequiredError(err) {
+			err = gceCS.convertDiskAndReAttach(ctx, project, volKey, disk, pdcsiContext, readWrite, instanceZone, instanceName)
+		}
+		if err != nil {
+			return nil, common.LoggedError("Failed to Attach: ", err), disk
+		}
 	}
 
 	err = gceCS.CloudProvider.WaitForAttach(ctx, project, volKey, disk.GetPDType(), instanceZone, instanceName)
@@ -1244,6 +1282,140 @@ func (gceCS *GCEControllerServer) executeControllerPublishVolume(ctx context.Con
 
 	klog.V(4).Infof("ControllerPublishVolume succeeded for disk %v to instance %v", volKey, nodeID)
 	return pubVolResp, nil, disk
+}
+
+// isConversionRequiredError checks if the error indicates that a disk conversion is required.
+func isConversionRequiredError(err error) bool {
+	return strings.Contains(err.Error(), "Please run the conversion tool to reset the supported VM families of this disk")
+}
+
+func (gceCS *GCEControllerServer) convertDiskAndReAttach(ctx context.Context, project string, volKey *meta.Key, disk *gce.CloudDisk, pdcsiContext *PDCSIContext, readWrite, instanceZone, instanceName string) error {
+	if !gceCS.EnablePdConversion {
+		klog.Info("PD conversion feature is not enabled, skipping automated conversion logic")
+		return nil
+	}
+	klog.Infof("Disk (%s) requires conversion before attachment, attempting conversion", volKey.Name)
+
+	// Attempt fast-only conversion
+	convertErr := gceCS.CloudProvider.ConvertDisk(ctx, project, volKey, instanceName, instanceZone, true /* quickConversionOnly */)
+	if convertErr == nil {
+		klog.Infof("Fast conversion for disk (%s) succeeded, retrying attach", volKey.Name)
+		metrics.SetConversionResult(ctx, "fast")
+		return gceCS.CloudProvider.AttachDisk(ctx, project, volKey, readWrite, attachableDiskTypePersistent, instanceZone, instanceName, pdcsiContext.ForceAttach)
+	} else if !isSlowConversionRequiredError(convertErr) {
+		klog.Infof("Ran into an unknown conversion error for disk (%s)", volKey.Name)
+		return fmt.Errorf("unknown error while attempting fast conversion: %w", convertErr)
+	}
+
+	// Slow conversion is required at this point, check for slow conversion opt-in
+	optedIn, err := gceCS.optedInForSlowConversion(ctx, volKey, instanceName)
+	if err != nil {
+		return fmt.Errorf("error while retrieving conversion opt-in information: %w", err)
+	}
+	if optedIn {
+		klog.Infof("Disk (%s) is opted-in, doing slow conversion", volKey.Name)
+		// Attempt conversion
+		convertErr := gceCS.CloudProvider.ConvertDisk(ctx, project, volKey, instanceName, instanceZone, false /* quickConversionOnly */)
+		if convertErr != nil {
+			return fmt.Errorf("unknown error while attempting slow conversion: %w", convertErr)
+		}
+		metrics.SetConversionResult(ctx, "slow")
+		return gceCS.CloudProvider.AttachDisk(ctx, project, volKey, readWrite, attachableDiskTypePersistent, instanceZone, instanceName, pdcsiContext.ForceAttach)
+	} else {
+		klog.Infof("Disk (%s) is not opted-in, aborting attach attempt", volKey.Name)
+	}
+	return status.Errorf(codes.FailedPrecondition, "Disk (%s) requires restriping before being attached to instance (%s). Please contact Google Support for further assistance.", volKey.Name, instanceName)
+}
+
+// isSlowConversionRequiredError checks if the error indicates that a slow disk conversion is required.
+func isSlowConversionRequiredError(err error) bool {
+	slowConversionRequiredErrorMsg := "Quick conversion is not supported on disk"
+	return strings.Contains(err.Error(), slowConversionRequiredErrorMsg)
+}
+
+// optedInForSlowConversion checks if the workload has opted in for slow disk conversion.
+// It checks for the "pd-conversion.gke.io/slow-conversion-opt-in" annotation on the
+// StorageClass, PersistentVolume, Node, and Pod associated with the volume.
+// An explicit "false" on any surface results in an opt-out.
+// Otherwise, a "true" on any surface results in an opt-in.
+// If the annotation is not present on any surface, it defaults to "true" i.e. opt-out.
+func (gceCS *GCEControllerServer) optedInForSlowConversion(ctx context.Context, volKey *meta.Key, instanceName string) (bool, error) {
+	const pdConversionAnnotation = "pd-conversion.gke.io/slow-conversion-opt-in"
+	optInFound := false
+
+	// A PersistentVolume object is required to check for StorageClass and Pods.
+	pv, err := k8sclient.GetPersistentVolumeWithRetry(ctx, volKey.Name)
+	if err != nil {
+		// If the PV can't be found, we can't determine the opt-in status.
+		return false, status.Errorf(codes.Internal, "failed to get PersistentVolume %s: %v", volKey.Name, err)
+	}
+
+	// 1. Check PersistentVolume
+	if val, ok := pv.Annotations[pdConversionAnnotation]; ok {
+		if val == "false" {
+			return false, nil // Explicit opt-out
+		}
+		if val == "true" {
+			optInFound = true
+		}
+	}
+
+	// 2. Check StorageClass
+	if pv.Spec.StorageClassName != "" {
+		sc, err := k8sclient.GetStorageClassWithRetry(ctx, pv.Spec.StorageClassName)
+		if err != nil {
+			return false, status.Errorf(codes.Internal, "failed to get StorageClass %s: %v", pv.Spec.StorageClassName, err)
+		}
+		if val, ok := sc.Annotations[pdConversionAnnotation]; ok {
+			if val == "false" {
+				return false, nil // Explicit opt-out
+			}
+			if val == "true" {
+				optInFound = true
+			}
+		}
+	}
+
+	// 3. Check Node
+	node, err := k8sclient.GetNodeWithRetry(ctx, instanceName)
+	if err != nil {
+		return false, status.Errorf(codes.Internal, "failed to get Node %s: %v", instanceName, err)
+	}
+	if val, ok := node.Annotations[pdConversionAnnotation]; ok {
+		if val == "false" {
+			return false, nil // Explicit opt-out
+		}
+		if val == "true" {
+			optInFound = true
+		}
+	}
+
+	// 4. Check Pod
+	if pv.Spec.ClaimRef != nil {
+		pvcName := pv.Spec.ClaimRef.Name
+		pvcNamespace := pv.Spec.ClaimRef.Namespace
+		podList, err := k8sclient.ListPodsInNamespace(ctx, pvcNamespace)
+		if err != nil {
+			return false, status.Errorf(codes.Internal, "failed to list pods in namespace %s: %v", pvcNamespace, err)
+		}
+
+		for _, pod := range podList.Items {
+			for _, volume := range pod.Spec.Volumes {
+				if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
+					if val, ok := pod.Annotations[pdConversionAnnotation]; ok {
+						if val == "false" {
+							return false, nil // Explicit opt-out
+						}
+						if val == "true" {
+							optInFound = true
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return optInFound, nil
 }
 
 func (gceCS *GCEControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
@@ -1367,6 +1539,8 @@ func (gceCS *GCEControllerServer) parameterProcessor() *parameters.ParameterProc
 		EnableDataCache:      gceCS.enableDataCache,
 		ExtraTags:            gceCS.Driver.extraTags,
 		EnableDynamicVolumes: gceCS.enableDynamicVolumes,
+		EnableGCEDiskStatus:  gceCS.enableGCEDiskStatus,
+		ClusterOwnershipID:   gceCS.clusterOwnershipID,
 	}
 }
 

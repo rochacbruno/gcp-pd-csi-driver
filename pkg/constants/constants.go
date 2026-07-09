@@ -16,7 +16,13 @@ limitations under the License.
 
 package constants
 
+import (
+	corev1 "k8s.io/api/core/v1"
+)
+
 const (
+	DriverName = "pd.csi.storage.gke.io"
+
 	// Keys for Topology. This key will be shared amongst drivers from GCP
 	TopologyKeyZone = "topology.gke.io/zone"
 
@@ -67,6 +73,20 @@ const (
 	// Node label for attach limit override
 	NodeRestrictionLabelPrefix = "node-restriction.kubernetes.io/%s"
 	AttachLimitOverrideLabel   = "gke-volume-attach-limit-override"
+
+	// StartupTaintKey is the key that blocks scheduling until the driver is ready.
+	StartupTaintKey    = "pd.csi.storage.gke.io/not-ready"
+	StartupTaintValue  = "true"
+	StartupTaintEffect = corev1.TaintEffectNoSchedule
+
+	// VolumePublishStatus is the key in volume publish context to indicate the status of the volume.
+	VolumePublishStatus = "volume-publish-status-gke-io"
+	ProvisioningStatus  = "provisioning"
+	ProvisionedStatus   = "provisioned"
+	AttachedStatus      = "attaching"
+
+	// ClusterIDLabel is the key in disk labels to indicate the cluster identifier of the disk.
+	ClusterIDLabel = "cluster-id-gke-io"
 )
 
 // doc https://cloud.google.com/compute/docs/general-purpose-machines

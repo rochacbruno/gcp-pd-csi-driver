@@ -29,6 +29,7 @@ import (
 
 	"k8s.io/klog/v2"
 	"k8s.io/utils/strings/slices"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/constants"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/convert"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/deviceutils"
@@ -38,10 +39,20 @@ import (
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/linkcache"
 	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/metrics"
 	mountmanager "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/mount-manager"
+
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
+	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+	"sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/controller/taint"
+	taintwebhook "sigs.k8s.io/gcp-compute-persistent-disk-csi-driver/pkg/webhook/taint"
 )
 
 var (
 	cloudConfigFilePath  = flag.String("cloud-config", "", "Path to GCE cloud provider config")
+	failCloseOnAuthError = flag.Bool("fail-close-on-auth-error", false, "If set to true, the CSI driver will fail its controller service to start if it cannot fetch the initial authentication token during startup. Default is false (legacy behavior).")
 	endpoint             = flag.String("endpoint", "unix:/tmp/csi.sock", "CSI endpoint")
 	runControllerService = flag.Bool("run-controller-service", true, "If set to false then the CSI driver does not activate its controller service (default: true)")
 	runNodeService       = flag.Bool("run-node-service", true, "If set to false then the CSI driver does not activate its node service (default: true)")
@@ -79,6 +90,7 @@ var (
 	enableHdHAFlag              = flag.Bool("allow-hdha-provisioning", false, "If set to true, will allow the driver to provision Hyperdisk-balanced High Availability disks")
 	enableDataCacheFlag         = flag.Bool("enable-data-cache", false, "If set to true, the CSI Driver will allow volumes to be provisioned with Data Cache configuration")
 	enableMultitenancyFlag      = flag.Bool("enable-multitenancy", false, "If set to true, the CSI Driver will support running on multitenant GKE clusters")
+	enablePdConversion          = flag.Bool("enable-pd-conversion", false, "If set to true, the CSI Driver will attempt to convert eligible PD disks to be compatible with attaching machine types during the attach operation")
 	nodeName                    = flag.String("node-name", "", "The node this driver is running on")
 
 	multiZoneVolumeHandleDiskTypesFlag = flag.String("multi-zone-volume-handle-disk-types", "", "Comma separated list of allowed disk types that can use the multi-zone volumeHandle. Used only if --multi-zone-volume-handle-enable")
@@ -101,15 +113,20 @@ var (
 
 	dynamicVolumes = flag.Bool("dynamic-volumes", false, "If set to true, the CSI driver will automatically select a compatible disk type based on the presence of the dynamic-volume parameter and disk types defined in the StorageClass. Disabled by default.")
 
+	gceDiskStatus      = flag.Bool("gce-disk-status", false, "If set to true, the CSI driver will update the volume-publish-status-gke-io label on the GCE disk resource after successful attachment to indicate the attachment status. Disabled by default.")
+	enableDiskCleanup  = flag.Bool("enable-disk-cleanup", false, "If set to true, the CSI driver will run a routine on startup to cleanup leaked GCE disks resources. Requires the cluster-ownership-id flag to be set. Disabled by default.")
+	clusterOwnershipID = flag.String("cluster-ownership-id", "", "The identifier for the cluster to which the CSI driver belongs. When specified, the id is applied to the GCE disk resource as a label")
+
 	diskCacheSyncPeriod = flag.Duration("disk-cache-sync-period", 10*time.Minute, "Period for the disk cache to check the /dev/disk/by-id/ directory and evaluate the symlinks")
 
 	enableDiskSizeValidation = flag.Bool("enable-disk-size-validation", false, "If set to true, the driver will validate that the requested disk size is matches the physical disk size. This flag is disabled by default.")
 
-	version string
-)
+	runTaintController = flag.Bool("run-taint-controller", false, "Enables the Taint Cleanup Controller (watches CSINodes and removes startup taints once CSINode resource is created)")
+	runTaintWebhook    = flag.Bool("run-taint-webhook", false, "Enables the Mutating Admission Webhook (adds startup taints to Nodes to delay workloads until the CSINode resource is created)")
+	webhookPort        = flag.Int("webhook-port", 9443, "The port for the admission webhook to listen on")
+	taintMetricsAddr   = flag.String("taint-metrics-addr", ":8081", "The address the taint controller metrics endpoint binds to.")
 
-const (
-	driverName = "pd.csi.storage.gke.io"
+	version string
 )
 
 func init() {
@@ -122,6 +139,11 @@ func init() {
 	urlFlag(&computeEndpoint, "compute-endpoint", "Compute endpoint")
 	klog.InitFlags(flag.CommandLine)
 	flag.Set("logtostderr", "true")
+
+	// Opt into the new klog behavior where -stderrthreshold is honored even
+	// when -logtostderr=true (see kubernetes/klog#212, kubernetes/klog#432).
+	flag.Set("legacy_stderr_threshold_behavior", "false") //nolint:errcheck
+	flag.Set("stderrthreshold", "INFO")                   //nolint:errcheck
 }
 
 func main() {
@@ -157,6 +179,16 @@ func handle() {
 				klog.Errorf("Could not shutdown otel exporter: %v", err.Error())
 			}
 		}()
+	}
+
+	// Run taint services if enabled
+	if *runTaintController || *runTaintWebhook {
+		// This blocks forever until the pod is killed.
+		if err := runTaintManager(*runTaintController, *runTaintWebhook); err != nil {
+			klog.Fatalf("Failed to run taint manager: %v", err)
+		}
+		// When manager stops, we return to main() and exit.
+		return
 	}
 
 	var metricsManager *metrics.MetricsManager = nil
@@ -195,6 +227,10 @@ func handle() {
 	extraTags, err := convert.ConvertTagsStringToMap(*extraTagsStr)
 	if err != nil {
 		klog.Fatalf("Bad extra tags: %v", err.Error())
+	}
+
+	if convert.CheckLabelValue(*clusterOwnershipID) != nil {
+		klog.Fatalf("Bad cluster ownership ID: %v", *clusterOwnershipID)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -242,7 +278,7 @@ func handle() {
 	// Initialize requirements for the controller service
 	var controllerServer *driver.GCEControllerServer
 	if *runControllerService {
-		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, computeEndpoint, computeEnvironment, waitForAttachConfig, listInstancesConfig, *enableMultitenancyFlag)
+		cloudProvider, err := gce.CreateCloudProvider(ctx, version, *cloudConfigFilePath, computeEndpoint, computeEnvironment, waitForAttachConfig, listInstancesConfig, *enableMultitenancyFlag, *failCloseOnAuthError)
 		if err != nil {
 			klog.Fatalf("Failed to get cloud provider: %v", err.Error())
 		}
@@ -260,9 +296,21 @@ func handle() {
 			EnableDiskTopology:       *diskTopology,
 			EnableDiskSizeValidation: *enableDiskSizeValidation,
 			EnableDynamicVolumes:     *dynamicVolumes,
+			EnableGCEDiskStatus:      *gceDiskStatus,
+			EnablePdConversion:       *enablePdConversion,
+			ClusterOwnershipID:       *clusterOwnershipID,
 		}
 
 		controllerServer = driver.NewControllerServer(gceDriver, cloudProvider, initialBackoffDuration, maxBackoffDuration, fallbackRequisiteZones, *enableStoragePoolsFlag, *enableDataCacheFlag, multiZoneVolumeHandleConfig, listVolumesConfig, provisionableDisksConfig, *enableHdHAFlag, args)
+		if *gceDiskStatus {
+			// Block startup if configured incorrectly, but fail-open on the cleanup routine.
+			if *clusterOwnershipID == "" {
+				klog.Fatalf("Cannot enable cleanup routine without cluster ownership ID specified")
+			}
+			if err := controllerServer.VerifyClusterDisks(ctx, *enableDiskCleanup); err != nil {
+				klog.Errorf("Failed to verify cluster disks: %v", err)
+			}
+		}
 	} else if *cloudConfigFilePath != "" {
 		klog.Warningf("controller service is disabled but cloud config given - it has no effect")
 	}
@@ -286,7 +334,7 @@ func handle() {
 			klog.Fatalf("Failed to get node info from API server: %v", err.Error())
 		}
 
-		deviceCache, err := linkcache.NewDeviceCacheForNode(ctx, *diskCacheSyncPeriod, *nodeName, driverName, deviceUtils, metricsManager)
+		deviceCache, err := linkcache.NewDeviceCacheForNode(ctx, *diskCacheSyncPeriod, *nodeName, constants.DriverName, deviceUtils, metricsManager)
 		if err != nil {
 			klog.Warningf("Failed to create device cache: %v", err.Error())
 		} else {
@@ -324,7 +372,7 @@ func handle() {
 
 	}
 
-	err = gceDriver.SetupGCEDriver(driverName, version, extraVolumeLabels, extraTags, identityServer, controllerServer, nodeServer)
+	err = gceDriver.SetupGCEDriver(constants.DriverName, version, extraVolumeLabels, extraTags, identityServer, controllerServer, nodeServer)
 	if err != nil {
 		klog.Fatalf("Failed to initialize GCE CSI Driver: %v", err.Error())
 	}
@@ -472,4 +520,57 @@ func setupDataCache(ctx context.Context, nodeName string, nodeId string) error {
 
 	klog.V(4).Infof("LSSD caching is setup for the Data Cache enabled node %s", nodeName)
 	return nil
+}
+
+func runTaintManager(enableController, enableWebhook bool) error {
+	klog.Info("Initializing Taint Feature Manager...")
+
+	kubeConfig, err := config.GetConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubeconfig: %v", err)
+	}
+
+	// Setup Manager
+	mgr, err := manager.New(kubeConfig, manager.Options{
+		WebhookServer: webhook.NewServer(webhook.Options{
+			Port: *webhookPort,
+		}),
+
+		Metrics: metricsserver.Options{
+			BindAddress: *taintMetricsAddr,
+		},
+
+		HealthProbeBindAddress: "0",
+		LeaderElection:         enableController,
+		LeaderElectionID:       "pd-csi-taint-controller-leader",
+	})
+	if err != nil {
+		return fmt.Errorf("unable to start manager: %v", err)
+	}
+
+	if enableWebhook {
+		klog.Infof("Registering Mutating Webhook on port %d...", *webhookPort)
+		hookServer := mgr.GetWebhookServer()
+		decoder := admission.NewDecoder(mgr.GetScheme())
+
+		taintHandler := &taintwebhook.NodeTainter{}
+		if err := taintHandler.InjectDecoder(&decoder); err != nil {
+			return fmt.Errorf("failed to inject decoder: %v", err)
+		}
+
+		hookServer.Register("/mutate-v1-node", &webhook.Admission{
+			Handler: taintHandler,
+		})
+	}
+
+	if enableController {
+		klog.Info("Registering Taint Cleanup Controller...")
+		if err := taint.Add(mgr); err != nil {
+			return fmt.Errorf("unable to add taint controller: %v", err)
+		}
+	}
+
+	klog.Info("Starting Taint Manager...")
+	// This blocks until the pod is killed
+	return mgr.Start(signals.SetupSignalHandler())
 }

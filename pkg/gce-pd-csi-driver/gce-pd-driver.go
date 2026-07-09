@@ -182,6 +182,9 @@ func NewControllerServer(gceDriver *GCEDriver, cloudProvider gce.GCECompute, err
 		enableDynamicVolumes:        args.EnableDynamicVolumes,
 		EnableDiskTopology:          args.EnableDiskTopology,
 		EnableDiskSizeValidation:    args.EnableDiskSizeValidation,
+		enableGCEDiskStatus:         args.EnableGCEDiskStatus,
+		EnablePdConversion:          args.EnablePdConversion,
+		clusterOwnershipID:          args.ClusterOwnershipID,
 	}
 }
 

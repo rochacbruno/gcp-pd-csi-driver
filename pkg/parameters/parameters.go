@@ -49,6 +49,13 @@ func (pp *ParameterProcessor) ExtractAndDefaultParameters(parameters map[string]
 		p.Labels[k] = v
 	}
 
+	if pp.EnableGCEDiskStatus {
+		p.Labels[constants.VolumePublishStatus] = constants.ProvisioningStatus
+	}
+	if pp.ClusterOwnershipID != "" {
+		p.Labels[constants.ClusterIDLabel] = pp.ClusterOwnershipID
+	}
+
 	for k, v := range pp.ExtraTags {
 		p.ResourceTags[k] = v
 	}
